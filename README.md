@@ -4,6 +4,8 @@
 >
 > APIs are public contracts. Once an endpoint is published to mobile apps, SDKs, and third-party developers, design mistakes are prohibitively expensive to fix. **Proto** is an AI API design research agent powered by **Sanity Context MCP**. Instead of relying purely on an LLM's pretrained memory or hallucinations, Proto dynamically formulates a research plan, queries the Sanity Knowledge Base (containing authoritative Google AIPs, RFC 9110 HTTP semantics, and Zalando guidelines), and synthesizes source-grounded answers directly in your terminal.
 
+📖 **Full Technical Documentation:** See [DOCUMENTATION.md](DOCUMENTATION.md) for detailed Phase 1 & Phase 2 architecture, MCP tool orchestration, and prompt engineering.
+
 ```text
                        USER
                         │
