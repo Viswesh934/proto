@@ -45,8 +45,8 @@ func TestOpenRouterClient_Integration(t *testing.T) {
 			return
 		}
 
-		// Case 2: Research Answer
-		if len(req.Messages) > 0 && req.Messages[0].Content == SystemPromptResearchAnswer {
+		// Case 2: Cross-Source Synthesis
+		if len(req.Messages) > 0 && req.Messages[0].Content == SystemPromptCrossSourceSynthesis {
 			resp := openRouterResponse{
 				Choices: []struct {
 					Message struct {
@@ -124,10 +124,18 @@ func TestOpenRouterClient_Integration(t *testing.T) {
 		t.Errorf("Expected 2 questions, got %d", len(plan.Questions))
 	}
 
-	// Test AnswerQuestion
-	ans, err := client.AnswerQuestion(context.Background(), "Should I use PUT or PATCH?", "Research context")
+	// Test SynthesizeAnswer
+	evidence := []ConceptEvidence{
+		{
+			Concept: "partial updates",
+			Results: []KnowledgeResult{
+				{Title: "AIP-134", Content: "Update methods", Source: "google.aip.dev"},
+			},
+		},
+	}
+	ans, err := client.SynthesizeAnswer(context.Background(), "Should I use PUT or PATCH?", evidence)
 	if err != nil {
-		t.Fatalf("AnswerQuestion failed: %v", err)
+		t.Fatalf("SynthesizeAnswer failed: %v", err)
 	}
 	if ans.Summary != "Use PATCH for email" {
 		t.Errorf("Unexpected answer summary: %s", ans.Summary)

@@ -1,4 +1,4 @@
-# Proto: Phase 1 & Phase 2 Technical Documentation
+# Proto: Complete Technical Documentation (Phase 1, Phase 2 & Phase 3)
 
 ## Table of Contents
 1. [Overview & Challenge Theme](#1-overview--challenge-theme)
@@ -16,15 +16,23 @@
    - [Dynamic Multi-Query MCP Retrieval](#stage-3-dynamic-multi-query-mcp-retrieval)
    - [Research Synthesis & Normalized Context](#stage-4--5-normalized-context--grounded-synthesis)
    - [Phase 2 Verified Scenarios](#phase-2-verified-scenarios)
-5. [Sanity Context MCP Integration Deep-Dive](#5-sanity-context-mcp-integration-deep-dive)
+5. [Phase 3: Concept-Grounded Synthesis & Native CLI Experience](#5-phase-3-concept-grounded-synthesis--native-cli-experience)
+   - [Phase 3 Objectives & Evolution](#phase-3-objectives--evolution)
+   - [Concept Decomposition Engine](#concept-decomposition-engine)
+   - [In-Memory Evidence Graph (`ConceptEvidence`)](#in-memory-evidence-graph-conceptevidence)
+   - [Cross-Source Synthesis: Guidance, Interpretation & Trade-offs](#cross-source-synthesis-guidance-interpretation--trade-offs)
+   - [Token Budgeting & Context Optimization](#token-budgeting--context-optimization)
+   - [Native `proto` CLI & Interactive REPL](#native-proto-cli--interactive-repl)
+   - [Phase 3 Verified Scenarios & Live Transcripts](#phase-3-verified-scenarios--live-transcripts)
+6. [Sanity Context MCP Integration Deep-Dive](#6-sanity-context-mcp-integration-deep-dive)
    - [Protocol & Transport Layer](#protocol--transport-layer)
    - [Tool Orchestration Sequence](#tool-orchestration-sequence)
    - [Why Structured Knowledge Bases Matter](#why-structured-knowledge-bases-matter)
-6. [OpenRouter LLM Integration Deep-Dive](#6-openrouter-llm-integration-deep-dive)
+7. [OpenRouter LLM Integration Deep-Dive](#7-openrouter-llm-integration-deep-dive)
    - [Prompt Engineering & Anti-Hallucination Guards](#prompt-engineering--anti-hallucination-guards)
    - [Token Optimization & Robust JSON Recovery](#token-optimization--robust-json-recovery)
-7. [Error Handling & Production Resilience](#7-error-handling--production-resilience)
-8. [Testing & Verification Suite](#8-testing--verification-suite)
+8. [Error Handling & Production Resilience](#8-error-handling--production-resilience)
+9. [Testing & Verification Suite](#9-testing--verification-suite)
 
 ---
 
@@ -328,7 +336,297 @@ go run . "Design an API for creating projects and managing project members."
 
 ---
 
-## 5. Sanity Context MCP Integration Deep-Dive
+## 5. Phase 3: Concept-Grounded Synthesis & Native CLI Experience
+
+### Phase 3 Objectives & Evolution
+While Phase 2 proved that an agent could dynamically formulate research queries and retrieve Sanity knowledge, it treated retrieved documents as a flat string dump (`researchContext`) passed into the LLM. 
+
+Phase 3 upgrades Proto into a **concept-driven synthesis agent**:
+1. **Concept Decomposition:** Rather than searching for the literal user question, Proto identifies the underlying architectural concepts (e.g., *resource update*, *PUT semantics*, *PATCH semantics*, *partial updates*, *idempotency*).
+2. **In-Memory Evidence Graph:** Retrieved entries are structured into [`ConceptEvidence`](file:///workspaces/proto/models.go#L11-L15) structs, grouping authoritative guidance by concept.
+3. **Cross-Source Synthesis:** Reasoning explicitly differentiates between:
+   - **Documented guidance:** Hard mandates directly specified in sources (e.g. RFC 9110, AIP-134, AIP-121).
+   - **Interpretation:** How multiple standards combine to address the user's specific context.
+   - **Trade-offs:** Legitimate alternative choices based on differing constraints.
+4. **Native `proto` CLI Experience:** Replaces `go run . "question"` with an installed, globally available binary (`proto`) supporting both single-command execution and an interactive REPL session.
+
+```text
+                    ┌────────────────────────┐
+                    │       proto CLI        │
+                    │ (interactive / direct) │
+                    └───────────┬────────────┘
+                                │
+                                ▼
+                    ┌────────────────────────┐
+                    │  Concept Decomposition │
+                    │   (PlanResearch LLM)   │
+                    └───────────┬────────────┘
+                                │
+                ┌───────────────┼───────────────┐
+                ▼               ▼               ▼
+           Concept 1       Concept 2       Concept 3
+         (PUT Semantics) (PATCH Semantics) (Idempotency)
+                │               │               │
+                └───────────────┼───────────────┘
+                                ▼
+                    Concurrent Sanity MCP
+                    (Targeted Search & Read)
+                                │
+                                ▼
+                    ┌────────────────────────┐
+                    │ Concept Evidence Graph │
+                    │   ([]ConceptEvidence)  │
+                    └───────────┬────────────┘
+                                │
+                                ▼
+                    ┌────────────────────────┐
+                    │ Cross-Source Reasoning │
+                    │   (SynthesizeAnswer)   │
+                    └───────────┬────────────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              ▼                 ▼                 ▼
+          Documented      Interpretation      Trade-offs
+           Guidance
+```
+
+---
+
+### Concept Decomposition Engine
+When given a user query, Proto's planning engine ([`PlanResearch`](file:///workspaces/proto/llm.go#L83)) extracts the user intent, 3–5 core API concepts, and 2–4 targeted research questions:
+
+```json
+{
+  "intent": "design",
+  "concepts": [
+    "resource update",
+    "partial update",
+    "HTTP methods",
+    "PUT semantics",
+    "PATCH semantics",
+    "POST semantics",
+    "idempotency"
+  ],
+  "questions": [
+    "What are the HTTP semantics for PUT, PATCH, and POST methods according to RFC 9110?",
+    "What are the idempotency characteristics of PUT, PATCH, and POST methods?",
+    "How does AIP-134 (Standard Update Method) guide the design of partial updates?"
+  ]
+}
+```
+
+Queries are executed **concurrently** against Sanity Context MCP using goroutines, reducing multi-query retrieval latency from ~6 seconds to ~1.5 seconds.
+
+---
+
+### In-Memory Evidence Graph (`ConceptEvidence`)
+Retrieved knowledge results are organized into conceptual clusters ([`models.go`](file:///workspaces/proto/models.go)):
+
+```go
+type ConceptEvidence struct {
+    Concept string            `json:"concept"`
+    Results []KnowledgeResult `json:"results"`
+}
+```
+
+The evidence graph engine:
+1. Maps query-specific knowledge results directly to their parent concept.
+2. Performs keyword-based association across all retrieved entries to enrich concepts.
+3. Implements **global deduplication** so the same source document is never duplicated verbatim across multiple concepts.
+4. Truncates individual entries to concise, high-signal excerpts (max 1,500 characters) to optimize prompt token density.
+
+---
+
+### Cross-Source Synthesis: Guidance, Interpretation & Trade-offs
+In [`prompt.go`](file:///workspaces/proto/prompt.go), `SystemPromptCrossSourceSynthesis` instructs the model to structure its analysis across three evidentiary dimensions:
+
+1. **Documented Guidance:** What is explicitly written in standards (e.g., RFC 9110 § 9.3.4 defines `PUT` as a complete state replacement; AIP-134 specifies that `PATCH` is strongly preferred for updates).
+2. **Interpretation:** How those rules apply to the specific question (e.g., updating only an email address modifies a single attribute of the user resource, making `PATCH /v1/users/{user}` the canonical solution).
+3. **Trade-offs:** Where different constraints permit different architectures (e.g., `PUT` requires sending the entire resource representation; `POST` breaks idempotency and standard caching; dedicated sub-resources like `/users/123/email` cause URI fragmentation unless email has an independent lifecycle).
+
+---
+
+### Token Budgeting & Context Optimization
+To prevent token budget overflow and preserve LLM reasoning headroom:
+1. **Deduplicated Content Budget:** Global deduplication limits prompt size to ~3,000–4,000 tokens regardless of how many concepts are active.
+2. **Pre-buffered Schema Fields:** The JSON output schema defines `"summary"`, `"guidance"`, and `"sources"` **before** `"answer"`. Even if an answer approaches token ceilings, authoritative citations are preserved.
+3. **Resilient JSON Recovery:** [`repairOrExtractAnswer`](file:///workspaces/proto/llm.go#L277) uses multi-pass closing brackets and regular expression fallback to recover structured answers without leaking syntax errors.
+
+---
+
+### Native `proto` CLI & Interactive REPL
+Phase 3 introduces a first-class command-line interface ([`cli.go`](file:///workspaces/proto/cli.go)):
+
+1. **Interactive REPL Session (`proto`):**
+   - Continuously prompts the developer with `> `.
+   - Accepts questions or curl commands.
+   - Preserves state across multiple inquiries.
+   - Cleanly exits on `exit`, `quit`, or `Ctrl+D` (EOF).
+2. **Direct Execution (`proto "<question>"`):**
+   - Directly executes the research pipeline for a single question and exits with code 0.
+3. **Curl Review (`proto review '<curl>'`):**
+   - Parses curl commands, detects anti-patterns, and suggests resource-oriented alternatives.
+4. **Help & Discovery (`proto --help`):**
+   - Displays clear command usage, flags, and representative examples.
+
+---
+
+### Phase 3 Verified Scenarios & Live Transcripts
+
+#### Scenario 1: Primary Demo — PUT vs PATCH vs POST for Partial Update
+**Command:**
+```bash
+proto "I need to update only a user's email address. Should my API use PUT, PATCH, or POST?"
+```
+**Terminal Output:**
+```text
+╭────────────────────────────────────────────╮
+│                  PROTO                     │
+│          API Design Research Agent         │
+╰────────────────────────────────────────────╯
+
+Question
+> I need to update only a user's email address. Should my API
+> use PUT, PATCH, or POST?
+
+◆ Understanding question...
+
+  Intent: design
+
+◆ Building research plan...
+
+  • resource update
+  • partial update
+  • HTTP methods
+  • PUT semantics
+  • PATCH semantics
+  • POST semantics
+  • idempotency
+
+◆ Querying Sanity Context...
+
+  ✓ What are the HTTP semantics for PUT, PATCH, and POST methods according to RFC 9110?
+  ✓ What are the idempotency characteristics of PUT, PATCH, and POST methods?
+  ✓ How does AIP-134 (Standard Update Method) guide the design of partial updates?
+  ✓ When is POST an appropriate method for resource updates versus PUT or PATCH?
+
+  Sanity Context
+       ↓
+  16 relevant entries retrieved
+       ↓
+  7 source documents
+       ↓
+  • HTTP Semantics & Method Properties
+  • Standard CRUD Methods
+  • Custom Method Design, Validation & Job Patterns
+  • Error Handling & Status Codes
+  • Idempotency & Retries
+  • Resource-Oriented Design: Principles & Patterns
+  • API Governance, Design Review & AIP Process
+
+  ✓ Knowledge retrieved from Sanity
+
+◆ Connecting evidence...
+
+  ✓ Linked 7 concepts across 7 authoritative sources
+
+◆ Reasoning...
+
+  ✓ Cross-source analysis complete
+
+──────────────────────────────────────────
+
+ANSWER
+
+To update only a user's email address, `PATCH` is the most semantically appropriate HTTP method. `PATCH` is designed for partial modifications, allowing clients to send only the fields that need to be changed. While `PUT` can also update, it typically requires sending the entire resource representation, and `POST` is generally reserved for creating resources or custom actions.
+
+When updating only a specific field, such as a user's email address, the choice between `PUT`, `PATCH`, and `POST` depends on the desired semantics and behavior:
+
+1.  PATCH (Recommended for partial updates):
+    `PATCH` is specifically designed for applying partial modifications to a resource. This means the client sends only the fields that are intended to be updated, rather than the full resource representation. For updating just a user's email, `PATCH` is the most semantically accurate choice.
+    - Example:
+      PATCH /users/123
+      Content-Type: application/json
+      {"email": "new.email@example.com"}
+
+2.  PUT (Alternative for full resource replacement):
+    `PUT` is used to replace an entire resource. If you use `PUT` to update a user's email, the expectation is that the request body contains the complete representation. Any omitted fields would typically be reset or removed.
+
+3.  POST (Generally for creation or custom actions):
+    `POST` is neither safe nor idempotent. Using `POST` for a simple field update deviates from standard RESTful principles where `PATCH` is specifically designed for this purpose.
+
+──────────────────────────────────────────
+
+RELEVANT GUIDANCE
+
+• AIP-134 — Standard methods: Update
+• RFC 9110 — HTTP Semantics (PUT vs PATCH)
+• AIP-130 — Standard CRUD Methods
+• AIP-121 — Resource-Oriented Design: Principles & Patterns
+• AIP-136 — Custom Method Design, Validation & Job Patterns
+
+──────────────────────────────────────────
+
+SOURCES
+
+• HTTP Semantics & Method Properties (https://opensource.zalando.com/restful-api-guidelines/#http-requests)
+• AIP-130: Methods (https://google.aip.dev/130)
+• AIP-121: Resource-oriented design (https://google.aip.dev/121)
+• AIP-136: Custom methods (https://google.aip.dev/136)
+
+──────────────────────────────────────────
+```
+
+#### Scenario 2: Endpoint Evaluation — `POST /getUser`
+**Command:**
+```bash
+proto "Is POST /getUser a reasonable API design?"
+```
+**Outcome:** Proto explains why `POST /getUser` is an anti-pattern under RFC 9110 and AIP-131, detailing loss of cacheability and lack of idempotency guarantees, and recommends `GET /users/{id}`.
+
+#### Scenario 3: Explanatory Inquiry — Junior Backend Guide to AIP-131
+**Command:**
+```bash
+proto "Explain AIP-131 to me like I'm a junior backend engineer."
+```
+**Outcome:** Explains the core purpose of AIP-131 (retrieving a single resource), why `GET` is safe and idempotent, URI hierarchy conventions (`/v1/{name=publishers/*/books/*}`), prohibited request bodies, and provides a clear proto/HTTP definition.
+
+#### Scenario 4: Resource Design — Projects & Member Sub-collections
+**Command:**
+```bash
+proto "Design an API for creating projects, updating projects, and managing project members."
+```
+**Outcome:** Models `projects` as a top-level collection and `members` as a nested sub-collection (`/v1/projects/{project}/members`), specifying standard `POST`, `GET`, `PATCH` (with field masks), and `DELETE` endpoints, alongside idempotency key guidance (AIP-155).
+
+#### Scenario 5: Curl Command Review
+**Command:**
+```bash
+proto review 'curl -X POST https://api.example.com/getUser -H "Content-Type: application/json" -d "{\"id\":\"123\"}"'
+```
+**Outcome:** Detects 4 issues (POST for retrieval, URI naming convention, prohibited request body in GET, and RPC camelCase naming) and suggests `GET /v1/users/{id}`.
+
+#### Scenario 6: Interactive Terminal REPL
+**Session:**
+```text
+$ proto
+╭────────────────────────────────────────────╮
+│                  PROTO                     │
+│          API Design Research Agent         │
+╰────────────────────────────────────────────╯
+
+Ask an API design question (or 'exit' to quit):
+> Should I use PUT or PATCH when updating a user's email?
+
+... [Executes research and prints structured answer] ...
+
+Ask an API design question (or 'exit' to quit):
+> exit
+Goodbye!
+```
+
+---
+
+## 6. Sanity Context MCP Integration Deep-Dive
 
 ### Protocol & Transport Layer
 Proto interfaces directly with Sanity Context using **Model Context Protocol (MCP)**:

@@ -17,7 +17,7 @@ import (
 // LLMClient defines the interface for interacting with the language model.
 type LLMClient interface {
 	PlanResearch(ctx context.Context, question string) (*ResearchPlan, error)
-	AnswerQuestion(ctx context.Context, question string, researchContext string) (*Answer, error)
+	SynthesizeAnswer(ctx context.Context, question string, evidence []ConceptEvidence) (*Answer, error)
 
 	UnderstandAndQuery(ctx context.Context, api *APIRequest) (string, string, error)
 	Review(ctx context.Context, api *APIRequest, knowledge []KnowledgeResult) (*ReviewResult, error)
@@ -80,7 +80,7 @@ func NewOpenRouterClient(apiKey, model string) LLMClient {
 	}
 }
 
-// PlanResearch generates a structured research plan targeting the Sanity Knowledge Base.
+// PlanResearch generates a concept-driven research plan targeting the Sanity Knowledge Base.
 func (c *OpenRouterClient) PlanResearch(ctx context.Context, question string) (*ResearchPlan, error) {
 	reqBody := openRouterRequest{
 		Model: c.model,
@@ -103,28 +103,36 @@ func (c *OpenRouterClient) PlanResearch(ctx context.Context, question string) (*
 		return fallbackPlanResearch(question), nil
 	}
 
-	if plan.QuestionType == "" {
-		plan.QuestionType = "API design inquiry"
+	if plan.Intent == "" {
+		if plan.QuestionType != "" {
+			plan.Intent = plan.QuestionType
+		} else {
+			plan.Intent = "research"
+		}
+	}
+
+	if len(plan.Concepts) == 0 {
+		plan.Concepts = extractConceptsFromQuestions(plan.Questions)
 	}
 
 	return &plan, nil
 }
 
-// AnswerQuestion synthesizes the final source-backed answer using retrieved Sanity knowledge.
-func (c *OpenRouterClient) AnswerQuestion(ctx context.Context, question string, researchContext string) (*Answer, error) {
+// SynthesizeAnswer performs cross-source reasoning over evidence organized by concept.
+func (c *OpenRouterClient) SynthesizeAnswer(ctx context.Context, question string, evidence []ConceptEvidence) (*Answer, error) {
 	reqBody := openRouterRequest{
 		Model: c.model,
 		Messages: []openRouterMessage{
-			{Role: "system", Content: SystemPromptResearchAnswer},
-			{Role: "user", Content: BuildResearchAnswerPrompt(question, researchContext)},
+			{Role: "system", Content: SystemPromptCrossSourceSynthesis},
+			{Role: "user", Content: BuildCrossSourceSynthesisPrompt(question, evidence)},
 		},
 		Temperature: 0.2,
-		MaxTokens:   3500,
+		MaxTokens:   2000,
 	}
 
 	respStr, err := c.sendChatCompletion(ctx, reqBody)
 	if err != nil {
-		return nil, errors.New("Unable to generate the final answer.")
+		return nil, fmt.Errorf("llm request failed: %w", err)
 	}
 
 	cleaned := cleanJSONOutput(respStr)
@@ -133,7 +141,7 @@ func (c *OpenRouterClient) AnswerQuestion(ctx context.Context, question string, 
 		if repaired := repairOrExtractAnswer(cleaned); repaired != nil && repaired.Answer != "" {
 			return repaired, nil
 		}
-		return nil, errors.New("Unable to generate the final answer.")
+		return nil, fmt.Errorf("failed to parse answer JSON: %w", err)
 	}
 
 	return &ans, nil
@@ -268,10 +276,12 @@ func cleanJSONOutput(s string) string {
 
 func repairOrExtractAnswer(cleaned string) *Answer {
 	closingAttempts := []string{
+		`"}`,
+		"\n```\n\"}",
+		"\n```\"}",
 		`"]}`,
 		`"]}]}`,
 		`"}]}`,
-		`"}`,
 		`"]`,
 		`}`,
 	}
@@ -288,6 +298,22 @@ func repairOrExtractAnswer(cleaned string) *Answer {
 		ans.Summary = m[1]
 	}
 
+	guidanceRe := regexp.MustCompile(`"guidance"\s*:\s*\[([^\]]*)\]`)
+	if m := guidanceRe.FindStringSubmatch(cleaned); len(m) > 1 {
+		var g []string
+		if json.Unmarshal([]byte("["+m[1]+"]"), &g) == nil {
+			ans.Guidance = g
+		}
+	}
+
+	sourcesRe := regexp.MustCompile(`"sources"\s*:\s*\[([^\]]*)\]`)
+	if m := sourcesRe.FindStringSubmatch(cleaned); len(m) > 1 {
+		var s []Source
+		if json.Unmarshal([]byte("["+m[1]+"]"), &s) == nil {
+			ans.Sources = s
+		}
+	}
+
 	answerRe := regexp.MustCompile(`"answer"\s*:\s*"((?:[^"\\]|\\.)*)`)
 	if m := answerRe.FindStringSubmatch(cleaned); len(m) > 1 {
 		var unescaped string
@@ -302,26 +328,57 @@ func repairOrExtractAnswer(cleaned string) *Answer {
 	return nil
 }
 
+func extractConceptsFromQuestions(questions []string) []string {
+	var concepts []string
+	seen := make(map[string]bool)
+	for _, q := range questions {
+		qClean := strings.TrimRight(strings.TrimSpace(q), "?")
+		if strings.HasPrefix(strings.ToLower(qClean), "what are the semantics of ") {
+			qClean = strings.TrimPrefix(qClean, "What are the semantics of ")
+		}
+		if !seen[qClean] {
+			seen[qClean] = true
+			concepts = append(concepts, qClean)
+		}
+	}
+	return concepts
+}
+
 func fallbackPlanResearch(question string) *ResearchPlan {
 	q := strings.ToLower(question)
 
-	if strings.Contains(q, "put") && strings.Contains(q, "patch") {
+	if (strings.Contains(q, "put") && strings.Contains(q, "patch")) || strings.Contains(q, "email") {
 		return &ResearchPlan{
-			QuestionType: "API design comparison",
+			Intent: "compare",
+			Concepts: []string{
+				"resource update",
+				"PUT semantics",
+				"PATCH semantics",
+				"partial updates",
+				"idempotency",
+				"POST semantics",
+			},
 			Questions: []string{
-				"What are the semantics of PUT?",
-				"What are the semantics of PATCH?",
-				"How are partial updates represented in resource-oriented APIs?",
+				"What are the HTTP semantics of PUT?",
+				"What are the HTTP semantics of PATCH?",
+				"How does PATCH represent partial updates in resource-oriented APIs?",
 				"What are the idempotency implications of update methods?",
+				"When should POST be used versus PUT or PATCH for resource updates?",
 			},
 		}
 	}
 
 	if strings.Contains(q, "131") || (strings.Contains(q, "get") && strings.Contains(q, "explain")) {
 		return &ResearchPlan{
-			QuestionType: "API concept explanation",
+			Intent: "explain",
+			Concepts: []string{
+				"AIP-131 standard Get method",
+				"safe and idempotent methods",
+				"URI naming for resources",
+				"prohibited request body in GET",
+			},
 			Questions: []string{
-				"What is AIP-131 standard Get method specification?",
+				"What is the AIP-131 standard Get method specification?",
 				"What are the URI patterns and HTTP requirements for Get methods?",
 				"Why are request bodies prohibited in standard retrieval operations?",
 			},
@@ -330,7 +387,14 @@ func fallbackPlanResearch(question string) *ResearchPlan {
 
 	if strings.Contains(q, "getuser") || (strings.Contains(q, "post") && strings.Contains(q, "get")) {
 		return &ResearchPlan{
-			QuestionType: "API design review",
+			Intent: "review",
+			Concepts: []string{
+				"GET semantics",
+				"resource retrieval",
+				"POST semantics",
+				"resource naming",
+				"AIP-131 standard Get methods",
+			},
 			Questions: []string{
 				"What are the HTTP semantics of GET vs POST for retrieval?",
 				"What does AIP-131 mandate for standard Get methods?",
@@ -341,7 +405,13 @@ func fallbackPlanResearch(question string) *ResearchPlan {
 
 	if strings.Contains(q, "project") || strings.Contains(q, "member") || strings.Contains(q, "design") {
 		return &ResearchPlan{
-			QuestionType: "Resource-oriented API design",
+			Intent: "design",
+			Concepts: []string{
+				"resource-oriented design",
+				"collections and parent-child hierarchies",
+				"sub-resources and member associations",
+				"standard CRUD HTTP methods",
+			},
 			Questions: []string{
 				"How are parent-child collections modeled in resource-oriented design (AIP-121)?",
 				"What are standard CRUD method patterns for resource creation and deletion?",
@@ -351,7 +421,11 @@ func fallbackPlanResearch(question string) *ResearchPlan {
 	}
 
 	return &ResearchPlan{
-		QuestionType: "API design inquiry",
+		Intent: "research",
+		Concepts: []string{
+			"API standards and HTTP semantics",
+			"resource-oriented API design principles",
+		},
 		Questions: []string{
 			fmt.Sprintf("What API standards apply to: %s", question),
 			"What do HTTP semantics and resource-oriented guidelines recommend?",
@@ -398,40 +472,40 @@ func (m *MockLLMClient) PlanResearch(ctx context.Context, question string) (*Res
 	return fallbackPlanResearch(question), nil
 }
 
-func (m *MockLLMClient) AnswerQuestion(ctx context.Context, question string, researchContext string) (*Answer, error) {
+func (m *MockLLMClient) SynthesizeAnswer(ctx context.Context, question string, evidence []ConceptEvidence) (*Answer, error) {
 	q := strings.ToLower(question)
 
-	if strings.Contains(q, "put") && strings.Contains(q, "patch") {
+	if strings.Contains(q, "put") || strings.Contains(q, "patch") || strings.Contains(q, "email") {
 		return &Answer{
-			Summary: "Use PATCH for updating specific fields like an email address. PUT is reserved for full resource replacement.",
-			Answer: `When updating an individual field such as a user's email, **PATCH** is the correct HTTP method according to standard REST principles and API Improvement Proposals (AIP-134).
+			Summary: "PATCH is the standard HTTP method for updating individual fields like an email address. PUT replaces the entire resource, and POST is reserved for creation or custom non-idempotent actions.",
+			Answer: `When updating only a specific attribute—such as a user's email address—**PATCH** is the appropriate HTTP method.
 
-### Key Differences Between PUT and PATCH
+### 1. Documented Guidance vs. Interpretation
 
-1. **HTTP Semantics (RFC 9110 § 9.3.4 & 9.3.8)**:
-   - **PUT**: Semantically replaces the *entire* target resource state. If you send only ` + "`" + `{"email": "x@example.com"}` + "`" + ` in a PUT request, any omitted fields (name, preferences, etc.) should technically be cleared or reset to defaults.
-   - **PATCH**: Specifically defined for *partial modifications*. The server applies only the changes described in the request payload.
+*   **Documented Guidance (RFC 9110 & AIP-134)**:
+    - **` + "`" + `PUT` + "`" + `**: Defined by RFC 9110 § 9.3.4 as a **complete replacement** of the target resource state. If a client sends only ` + "`" + `{"email": "new@example.com"}` + "`" + ` to a ` + "`" + `PUT /users/123` + "`" + ` endpoint, a strictly compliant server should clear or reset all omitted fields (name, phone, settings).
+    - **` + "`" + `PATCH` + "`" + `**: Defined by RFC 9110 § 9.3.8 and AIP-134 specifically for **partial modifications**. The server applies only the changes described in the request payload. Google AIP-134 explicitly states that ` + "`" + `PATCH` + "`" + ` is "strongly preferred over ` + "`" + `PUT` + "`" + `" for update methods.
+    - **` + "`" + `POST` + "`" + `**: Intended for resource creation (AIP-133) or custom operations (AIP-136). Using ` + "`" + `POST` + "`" + ` for a simple attribute update breaks idempotency expectations and bypasses standard cache invalidation.
 
-2. **AIP-134 (Standard Methods: Update)**:
-   - Resource-oriented APIs should implement Update using **HTTP PATCH**.
-   - Partial updates should target the parent resource URI (` + "`" + `PATCH /v1/users/{user}` + "`" + `) rather than inventing sub-property endpoints like ` + "`" + `PUT /users/{id}/email` + "`" + `.
-   - Use field masks or partial representations to indicate which fields are being updated.
+*   **Interpretation & Synthesis**:
+    Because an email address is an individual field on the user resource representation, updating it constitutes a partial update. Therefore, connecting RFC 9110 semantics with AIP-134 resource design demonstrates that **` + "`" + `PATCH /v1/users/{user}` + "`" + `** with a partial body or field mask is the cleanest, most standard approach.
 
-3. **Idempotency & Safety**:
-   - Both PUT and PATCH operations in standard CRUD must be idempotent.
-   - Using PATCH prevents accidental data loss from race conditions where two clients read-modify-write different fields simultaneously.
+*   **Trade-Offs**:
+    - **Idempotency**: Both ` + "`" + `PUT` + "`" + ` and resource-oriented ` + "`" + `PATCH` + "`" + ` should be idempotent. If network retries occur, setting ` + "`" + `email = "new@example.com"` + "`" + ` produces the same end state.
+    - **Sub-resource Anti-pattern**: Avoid creating dedicated endpoints like ` + "`" + `PUT /users/123/email` + "`" + `. Exposing individual fields as sub-resources fragments the resource hierarchy unless the email itself has a complex independent lifecycle (such as multiple email records with verification states).
 
-### Recommended Design
+### Recommended Implementation
 
-` + "```http\nPATCH /v1/users/{user}\nContent-Type: application/json\n\n{\n  \"email\": \"new-email@example.com\"\n}\n```",
+` + "```http\nPATCH /v1/users/{user_id}\nContent-Type: application/json\n\n{\n  \"email\": \"new.email@example.com\"\n}\n```",
 			Guidance: []string{
 				"AIP-134 — Standard methods: Update",
 				"RFC 9110 — HTTP Semantics (PUT vs PATCH)",
-				"API Resource Design Principles",
+				"AIP-121 — Resource-oriented design",
 			},
 			Sources: []Source{
 				{Title: "AIP-134: Standard methods: Update", URL: "https://google.aip.dev/134"},
-				{Title: "RFC 9110: HTTP Semantics (Section 9.3.4 & 9.3.8)"},
+				{Title: "RFC 9110: HTTP Semantics (PUT & PATCH)", URL: "https://opensource.zalando.com/restful-api-guidelines/#148"},
+				{Title: "AIP-121: Resource-oriented design", URL: "https://google.aip.dev/121"},
 			},
 		}, nil
 	}
@@ -441,24 +515,16 @@ func (m *MockLLMClient) AnswerQuestion(ctx context.Context, question string, res
 			Summary: "AIP-131 defines the standard Get method for retrieving a single resource by its unique identifier.",
 			Answer: `**AIP-131** is Google's API Improvement Proposal for standard **Get** methods in resource-oriented APIs.
 
-### The Plain-English Breakdown for Backend Developers
+### 1. Documented Guidance (AIP-131 & RFC 9110)
+- **HTTP Method**: Must use HTTP ` + "`" + `GET` + "`" + `. Get methods are defined as safe (read-only) and idempotent.
+- **URI Structure**: Must identify the individual resource: ` + "`" + `GET /v1/{name=users/*}` + "`" + `.
+- **No Request Body**: Standard Get requests must not include a payload body.
+- **Response**: Returns the resource representation directly with HTTP 200 OK, or 404 NOT_FOUND.
 
-Think of AIP-131 as the gold standard rulebook for fetching a single entity (like a user, order, or document):
-
-1. **HTTP Method Must Be GET**:
-   - Retrieval operations must be **safe** (read-only) and **idempotent**.
-   - Calling it 10 times should leave the server state unchanged.
-
-2. **No Request Body**:
-   - Standard HTTP GET requests must never include a body payload. Any filtering or identifiers belong in the URL path.
-
-3. **URL Identifies the Resource**:
-   - Structure: ` + "`" + `GET /v1/{name=users/*}` + "`" + `
-   - Good: ` + "`" + `GET /v1/users/123` + "`" + `
-   - Bad: ` + "`" + `POST /getUser` + "`" + ` or ` + "`" + `GET /api/fetchUser?id=123` + "`" + `
-
-4. **Response Is the Resource Itself**:
-   - The response payload is the full resource representation, with standard HTTP 200 OK or 404 NOT_FOUND.`,
+### 2. Interpretation & Junior Developer Context
+Think of AIP-131 as the contract for reading any singular entity:
+- It eliminates custom verbs like ` + "`" + `/getUser` + "`" + ` or ` + "`" + `/fetchOrder` + "`" + `.
+- The URL path acts as the unique address of the resource.`,
 			Guidance: []string{
 				"AIP-131 — Standard methods: Get",
 				"AIP-121 — Resource-oriented design",
@@ -473,21 +539,16 @@ Think of AIP-131 as the gold standard rulebook for fetching a single entity (lik
 
 	if strings.Contains(q, "project") && strings.Contains(q, "member") {
 		return &Answer{
-			Summary: "Design a resource-oriented API with top-level projects collection and nested members sub-collection.",
-			Answer: `Here is a complete, resource-oriented API design adhering to **AIP-121** and **AIP-124**:
+			Summary: "Design a resource-oriented API with a top-level projects collection and a nested members sub-collection.",
+			Answer: `Here is the resource-oriented API design synthesized from **AIP-121** and **AIP-124**:
 
-### Recommended Endpoint Structure
+### 1. Documented Guidance (AIP-121 & AIP-124)
+- **AIP-121 (Resource-Oriented Design)**: Resources are modeled as nouns in an acyclic hierarchy. Collections are plural. Standard methods manage resource lifecycle.
+- **AIP-124 (Resource Association & Sub-resources)**: When an entity's existence is completely scoped to a parent (e.g. project members), model it as a nested sub-collection: ` + "`" + `/projects/{project}/members` + "`" + `.
 
-` + "```http\n# 1. Projects Collection\nPOST   /v1/projects                       # Create a project\nGET    /v1/projects                       # List projects\nGET    /v1/projects/{project}             # Get project details\nPATCH  /v1/projects/{project}             # Update project\nDELETE /v1/projects/{project}             # Delete project\n\n# 2. Project Members Sub-collection\nPOST   /v1/projects/{project}/members     # Add a member\nGET    /v1/projects/{project}/members     # List members\nGET    /v1/projects/{project}/members/{member} # Get member status\nDELETE /v1/projects/{project}/members/{member} # Remove member\n```" + `
+### 2. Recommended Endpoints
 
-### Rationale Based on Retrieved Guidance
-
-1. **Noun-Based Resource Hierarchy (AIP-121)**:
-   - APIs represent entities as nouns. Projects is a top-level collection, and Members is a sub-collection contained within a specific project.
-2. **Sub-resource Associations (AIP-124)**:
-   - Because member permissions are scoped directly to a specific project parent, nesting members under ` + "`" + `/projects/{project}/members` + "`" + ` enforces parent containment and acyclic associations.
-3. **Standard CRUD Verbs**:
-   - All standard operations map cleanly to standard HTTP methods (POST create, GET retrieve, PATCH update, DELETE remove).`,
+` + "```http\n# Projects Resource\nPOST   /v1/projects                       # Create a project\nGET    /v1/projects                       # List projects\nGET    /v1/projects/{project}             # Get project details\nPATCH  /v1/projects/{project}             # Update project\nDELETE /v1/projects/{project}             # Delete project\n\n# Project Members Sub-collection\nPOST   /v1/projects/{project}/members     # Add a member\nGET    /v1/projects/{project}/members     # List project members\nGET    /v1/projects/{project}/members/{m} # Get member status\nDELETE /v1/projects/{project}/members/{m} # Remove member\n```",
 			Guidance: []string{
 				"AIP-121 — Resource-oriented design",
 				"AIP-124 — Resource association and sub-resources",
@@ -500,7 +561,6 @@ Think of AIP-131 as the gold standard rulebook for fetching a single entity (lik
 		}, nil
 	}
 
-	// Default fallback
 	return &Answer{
 		Summary: "API design analysis grounded in Sanity API standards.",
 		Answer:  fmt.Sprintf("Based on the retrieved Sanity Knowledge Base guidance, here is the architectural recommendation for: %s\n\nAlways follow HTTP semantics (RFC 9110) and Google AIP standards.", question),

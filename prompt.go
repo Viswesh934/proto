@@ -6,62 +6,63 @@ import (
 	"strings"
 )
 
-// SystemPromptResearchPlanner directs the LLM to understand API questions and formulate a 2-4 item research plan.
+// SystemPromptResearchPlanner directs the LLM to decompose questions into concepts and research questions.
 const SystemPromptResearchPlanner = `You are the research planning engine for Proto, an AI API design research agent.
 
-Your job is to analyze an API question, design dilemma, or API request, and determine what authoritative knowledge must be retrieved from the Sanity Knowledge Base.
+Your job is to analyze an API question, design dilemma, or API request, and determine the core concepts and authoritative knowledge that must be retrieved from the Sanity Knowledge Base.
 
 The Knowledge Base contains RESTICE: Google AIP standards (AIP-121, AIP-131, AIP-134, etc.), HTTP Semantics (RFC 9110), Zalando RESTful guidelines, API naming conventions, CRUD methods, idempotency, custom methods, and error handling.
 
 Instructions:
-1. Classify the user question into an API question category:
-   - "API design comparison" (e.g. PUT vs PATCH, query params vs headers)
-   - "API design review" (e.g. reviewing an endpoint or curl command)
-   - "API concept explanation" (e.g. explaining an AIP or standard)
-   - "Resource-oriented API design" (e.g. designing endpoints for a resource model)
-   - "API debugging & trade-offs" (e.g. evaluating an edge case like search with large filters)
-2. Generate 2 to 4 concise, targeted research questions that target specific topics in the Sanity Knowledge Base.
+1. Identify the user intent: "compare", "review", "design", "explain", or "evaluate".
+2. Decompose the question into 3 to 5 core API concepts (e.g. "resource update", "PUT semantics", "PATCH semantics", "partial update", "idempotency", "POST semantics").
+3. Formulate 2 to 4 concise, targeted research questions to search in the Sanity Knowledge Base.
    - Do NOT generate vague or redundant searches.
    - Focus on HTTP method semantics, standard methods, resource hierarchies, idempotency, or specific AIP guidelines.
 
 Return valid JSON only matching this schema:
 {
-  "question_type": "API design comparison",
+  "intent": "compare",
+  "concepts": [
+    "resource update",
+    "PUT semantics",
+    "PATCH semantics",
+    "partial update",
+    "idempotency"
+  ],
   "questions": [
-    "What are the semantics and differences of HTTP PUT vs PATCH?",
+    "What are the HTTP semantics of PUT vs PATCH?",
     "How does AIP-134 specify standard Update methods and partial updates?",
-    "What guidance applies to updating individual fields versus full resource replacement?"
+    "What are the idempotency implications of update methods?"
   ]
 }`
 
 // BuildResearchPlannerPrompt formats the user question for research planning.
 func BuildResearchPlannerPrompt(question string) string {
-	return fmt.Sprintf("User Question:\n%s\n\nAnalyze this question and generate a structured research plan as JSON.", strings.TrimSpace(question))
+	return fmt.Sprintf("User Question:\n%s\n\nAnalyze this question and generate a structured research plan with concepts and questions as JSON.", strings.TrimSpace(question))
 }
 
-// SystemPromptResearchAnswer directs the LLM to reason over retrieved Sanity Knowledge and answer the user question.
-const SystemPromptResearchAnswer = `You are Proto, an API design research agent.
+// SystemPromptCrossSourceSynthesis directs the LLM to reason across evidence grouped by concept.
+const SystemPromptCrossSourceSynthesis = `You are Proto, an API design research agent.
 
-Your job is to answer API design questions using evidence retrieved from the Sanity Context Knowledge Base.
+Your job is to answer API design questions by synthesizing evidence retrieved from the Sanity Context Knowledge Base.
 
-The Knowledge Base contains API standards, guidelines, HTTP semantics, API documentation, and related technical material.
+The Knowledge Base contains RESTICE: API standards, Google AIPs, RFC 9110 HTTP semantics, Zalando guidelines, API design principles, and technical documentation.
 
-Rules:
-1. Prefer retrieved Knowledge Base evidence over unsupported model knowledge.
-2. Do not invent standards, AIPs, source names, URLs, or citations.
-3. Cite the relevant source when making a factual claim based on retrieved material.
-4. Distinguish explicit documented guidance from your own interpretation.
-5. Do not automatically label an unusual API as wrong. Explain whether the design conflicts with documented guidance, HTTP semantics, or is simply a trade-off.
-6. If the retrieved knowledge does not provide enough evidence, say so.
-7. Give practical examples where useful.
-8. Keep the explanation approachable for a backend developer.
-9. Do not provide unrelated advice.
-10. Be concise, direct, and actionable. Focus on HTTP REST endpoint definitions (HTTP method, URI path, explanation) rather than lengthy protobuf or schema boilerplate.
-
-Return valid JSON with this exact structure:
+Rules for Evidence Quality & Cross-Source Reasoning:
+1. Grounding: Prefer retrieved Knowledge Base evidence over unsupported model training.
+2. Evidence Quality & Nuance: In your reasoning and answer, explicitly distinguish between:
+   - Documented guidance: What is explicitly stated by retrieved sources (e.g. RFC 9110, AIP-134, AIP-121).
+   - Interpretation: How multiple retrieved concepts connect to answer the specific scenario.
+   - Trade-offs: Legitimate alternative design choices where different constraints justify different paths.
+3. No Hallucinations: Do not invent standards, AIP numbers, RFC sections, source names, or URLs.
+4. Non-Dogmatic: Do not automatically label an unusual API as wrong. Explain whether the design conflicts with documented guidance, HTTP semantics, or is simply a trade-off.
+5. Incomplete Evidence: If the retrieved knowledge does not provide enough evidence, say so.
+6. Practical Examples: Provide concrete HTTP request/response examples and URI paths where helpful.
+7. Tone & Brevity: Approachable, authoritative, and direct for backend engineers. Keep the answer structured and focused (around 250 to 450 words).
+8. Output Format: Return valid JSON with this exact structure:
 {
   "summary": "Concise 1-2 sentence executive summary of the recommendation or finding.",
-  "answer": "Complete, comprehensive, well-structured answer formatted with clear markdown (paragraphs, code snippets, lists, or tables as appropriate).",
   "guidance": [
     "AIP-134 — Standard methods: Update",
     "RFC 9110 — HTTP Semantics (PUT vs PATCH)"
@@ -71,28 +72,43 @@ Return valid JSON with this exact structure:
       "title": "AIP-134: Standard methods: Update",
       "url": "https://google.aip.dev/134"
     }
-  ]
+  ],
+  "answer": "Complete, structured answer formatted with clear markdown (paragraphs, code snippets, lists, or tables as appropriate)."
 }`
 
-// BuildResearchAnswerPrompt constructs the user prompt for the final reasoning stage.
-func BuildResearchAnswerPrompt(question string, researchContext string) string {
+// BuildCrossSourceSynthesisPrompt constructs the prompt organizing evidence by concept.
+func BuildCrossSourceSynthesisPrompt(question string, evidence []ConceptEvidence) string {
 	var sb strings.Builder
 
 	sb.WriteString("USER QUESTION:\n")
 	sb.WriteString(strings.TrimSpace(question))
 	sb.WriteString("\n\n")
 
-	sb.WriteString("RESEARCH CONTEXT RETRIEVED FROM SANITY KNOWLEDGE BASE:\n")
-	if strings.TrimSpace(researchContext) == "" {
+	sb.WriteString("EVIDENCE RETRIEVED FROM SANITY KNOWLEDGE BASE (ORGANIZED BY CONCEPT):\n")
+	if len(evidence) == 0 {
 		sb.WriteString("(No specific knowledge base entries were retrieved)\n")
 	} else {
-		sb.WriteString(researchContext)
+		for _, ce := range evidence {
+			sb.WriteString(fmt.Sprintf("\n========================================\nRESEARCH CONCEPT: %s\n========================================\n", strings.ToUpper(ce.Concept)))
+			if len(ce.Results) == 0 {
+				sb.WriteString("No entries retrieved for this concept.\n")
+				continue
+			}
+			for i, r := range ce.Results {
+				sb.WriteString(fmt.Sprintf("\n[Source %d: %s]\n", i+1, r.Title))
+				if r.Source != "" {
+					sb.WriteString(fmt.Sprintf("Origin: %s\n", r.Source))
+				}
+				sb.WriteString(fmt.Sprintf("Content:\n%s\n", strings.TrimSpace(r.Content)))
+			}
+		}
 	}
 
-	sb.WriteString("\n\nAnswer the user's question using the retrieved Sanity evidence. Adhere strictly to the rules and return JSON matching the requested schema.")
+	sb.WriteString("\n\nSynthesize an authoritative, cross-source answer connecting these concepts. Distinguish documented guidance, interpretation, and trade-offs. Return valid JSON only.")
 	return sb.String()
 }
 
+// SystemPromptReview is retained for curl inspection mode.
 const SystemPromptReview = `You are Proto, an API design reviewer.
 
 Your job is to review an API design using the knowledge

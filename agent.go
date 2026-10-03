@@ -34,38 +34,65 @@ func NewAgent(cfg *Config) *Agent {
 }
 
 // Research coordinates the multi-stage research agent workflow for an API question.
-func (a *Agent) Research(ctx context.Context, question string) (*Answer, *ResearchPlan, []KnowledgeResult, error) {
-	// Stage 1 & 2: Understand question & Build research plan
+func (a *Agent) Research(ctx context.Context, question string) (*Answer, *ResearchPlan, []ConceptEvidence, error) {
+	// Stage 1: Understand question
 	fmt.Printf("%s%s◆ Understanding question...%s\n\n", colorBold, colorCyan, colorReset)
 	plan, err := a.llm.PlanResearch(ctx, question)
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	fmt.Printf("  Type: %s%s%s\n\n", colorBold, plan.QuestionType, colorReset)
-
-	fmt.Printf("%s%s◆ Building research plan...%s\n\n", colorBold, colorCyan, colorReset)
-	for i, q := range plan.Questions {
-		fmt.Printf("  %d. %s\n", i+1, q)
+	intent := plan.Intent
+	if intent == "" {
+		intent = "research"
 	}
-	fmt.Println()
+	fmt.Printf("  Intent: %s%s%s\n\n", colorBold, intent, colorReset)
+
+	// Stage 2: Build research plan with concepts
+	fmt.Printf("%s%s◆ Building research plan...%s\n\n", colorBold, colorCyan, colorReset)
+	if len(plan.Concepts) > 0 {
+		for _, c := range plan.Concepts {
+			fmt.Printf("  • %s\n", c)
+		}
+		fmt.Println()
+	}
 
 	// Stage 3: Query Sanity Context MCP for each research question
 	fmt.Printf("%s%s◆ Querying Sanity Context...%s\n\n", colorBold, colorCyan, colorReset)
+
+	type searchOutcome struct {
+		query   string
+		results []KnowledgeResult
+		err     error
+	}
+
+	// Run Sanity queries concurrently for responsiveness
+	outcomeCh := make(chan searchOutcome, len(plan.Questions))
+	for _, q := range plan.Questions {
+		go func(query string) {
+			res, searchErr := a.knowledge.Search(ctx, query)
+			outcomeCh <- searchOutcome{query: query, results: res, err: searchErr}
+		}(q)
+	}
+
+	resultsByQuery := make(map[string][]KnowledgeResult)
 	var allKnowledge []KnowledgeResult
 	seenTitles := make(map[string]bool)
 	var sourceTitles []string
 
-	for _, q := range plan.Questions {
-		results, err := a.knowledge.Search(ctx, q)
-		if err != nil {
-			fmt.Printf("  %s✗%s %s\n", colorRed, colorReset, q)
+	for i := 0; i < len(plan.Questions); i++ {
+		outcome := <-outcomeCh
+		if outcome.err != nil {
+			fmt.Printf("  %s✗%s %s\n", colorRed, colorReset, outcome.query)
 			continue
 		}
-		fmt.Printf("  %s✓%s %s\n", colorGreen, colorReset, q)
-		for _, k := range results {
-			if !seenTitles[k.Title] && strings.TrimSpace(k.Content) != "" {
-				seenTitles[k.Title] = true
-				sourceTitles = append(sourceTitles, k.Title)
+		fmt.Printf("  %s✓%s %s\n", colorGreen, colorReset, outcome.query)
+		resultsByQuery[outcome.query] = outcome.results
+		for _, k := range outcome.results {
+			if strings.TrimSpace(k.Content) != "" {
+				if !seenTitles[k.Title] {
+					seenTitles[k.Title] = true
+					sourceTitles = append(sourceTitles, k.Title)
+				}
 				allKnowledge = append(allKnowledge, k)
 			}
 		}
@@ -73,7 +100,7 @@ func (a *Agent) Research(ctx context.Context, question string) (*Answer, *Resear
 	fmt.Println()
 
 	if len(allKnowledge) == 0 {
-		fmt.Fprintf(os.Stderr, "  %s⚠ No sufficiently relevant knowledge was found.%s\n\n  Proto will answer only from the available evidence and clearly identify the limitation.\n\n", colorYellow, colorReset)
+		fmt.Fprintf(os.Stderr, "  %s⚠ No sufficiently relevant knowledge was found.%s\n\n  Proto will answer only from available evidence and clearly identify the limitation.\n\n", colorYellow, colorReset)
 	} else {
 		fmt.Printf("  %sSanity Context%s\n", colorCyan, colorReset)
 		fmt.Printf("       ↓\n")
@@ -88,29 +115,100 @@ func (a *Agent) Research(ctx context.Context, question string) (*Answer, *Resear
 		fmt.Printf("  %s✓%s Knowledge retrieved from Sanity\n\n", colorGreen, colorReset)
 	}
 
-	// Stage 4: Normalize retrieved material into research context
-	var sb strings.Builder
-	for i, k := range allKnowledge {
-		sb.WriteString(fmt.Sprintf("\n[Entry %d: %s]\nSource: %s\n%s\n", i+1, k.Title, k.Source, k.Content))
-	}
-	researchContext := sb.String()
+	// Stage 4: Connect evidence into concept graph
+	fmt.Printf("%s%s◆ Connecting evidence...%s\n\n", colorBold, colorCyan, colorReset)
 
-	// Stage 5: Final Reasoning over retrieved knowledge
-	fmt.Printf("%s%s◆ Reasoning over retrieved knowledge...%s\n\n", colorBold, colorCyan, colorReset)
-	answer, err := a.llm.AnswerQuestion(ctx, question, researchContext)
+	var conceptEvidence []ConceptEvidence
+	assignedGlobally := make(map[string]bool)
+
+	if len(plan.Concepts) > 0 {
+		for i, c := range plan.Concepts {
+			var matching []KnowledgeResult
+
+			// 1. Direct query results mapping if available
+			if i < len(plan.Questions) {
+				if qr, ok := resultsByQuery[plan.Questions[i]]; ok {
+					for _, item := range qr {
+						if !assignedGlobally[item.Title] {
+							assignedGlobally[item.Title] = true
+							matching = append(matching, truncateContent(item, 1500))
+							if len(matching) >= 2 {
+								break
+							}
+						}
+					}
+				}
+			}
+
+			// 2. Keyword relevance across all retrieved knowledge
+			if len(matching) < 2 {
+				conceptWords := strings.Fields(strings.ToLower(c))
+				for _, item := range allKnowledge {
+					if assignedGlobally[item.Title] {
+						continue
+					}
+					itemLower := strings.ToLower(item.Title + " " + item.Content)
+					for _, w := range conceptWords {
+						if len(w) > 3 && strings.Contains(itemLower, w) {
+							assignedGlobally[item.Title] = true
+							matching = append(matching, truncateContent(item, 1500))
+							break
+						}
+					}
+					if len(matching) >= 2 {
+						break
+					}
+				}
+			}
+
+			// 3. Fallback to any remaining unassigned entry
+			if len(matching) == 0 {
+				for _, item := range allKnowledge {
+					if !assignedGlobally[item.Title] {
+						assignedGlobally[item.Title] = true
+						matching = append(matching, truncateContent(item, 1500))
+						break
+					}
+				}
+			}
+
+			conceptEvidence = append(conceptEvidence, ConceptEvidence{
+				Concept: c,
+				Results: matching,
+			})
+		}
+	} else {
+		for q, qr := range resultsByQuery {
+			var truncated []KnowledgeResult
+			for _, item := range qr {
+				truncated = append(truncated, truncateContent(item, 1500))
+			}
+			conceptEvidence = append(conceptEvidence, ConceptEvidence{
+				Concept: q,
+				Results: truncated,
+			})
+		}
+	}
+
+	fmt.Printf("  %s✓%s Linked %d concepts across %d authoritative sources\n\n", colorGreen, colorReset, len(conceptEvidence), len(sourceTitles))
+
+	// Stage 5: Final Cross-source Reasoning
+	fmt.Printf("%s%s◆ Reasoning...%s\n\n", colorBold, colorCyan, colorReset)
+	answer, err := a.llm.SynthesizeAnswer(ctx, question, conceptEvidence)
 	if err != nil {
-		return nil, plan, allKnowledge, err
+		return nil, plan, conceptEvidence, err
 	}
-	fmt.Printf("  %s✓%s Analysis complete\n\n", colorGreen, colorReset)
+	fmt.Printf("  %s✓%s Cross-source analysis complete\n\n", colorGreen, colorReset)
 
-	// Ensure sources on answer
+	// Ensure sources and evidence on answer
 	if len(answer.Sources) == 0 {
 		for _, t := range sourceTitles {
 			answer.Sources = append(answer.Sources, Source{Title: t})
 		}
 	}
+	answer.Evidence = conceptEvidence
 
-	return answer, plan, allKnowledge, nil
+	return answer, plan, conceptEvidence, nil
 }
 
 // Review orchestrates the curl-specific review workflow for backward compatibility.
@@ -175,4 +273,16 @@ func (a *Agent) Review(ctx context.Context, curlCmd string) (*ReviewResult, *API
 	}
 
 	return result, api, nil
+}
+
+func truncateContent(item KnowledgeResult, maxChars int) KnowledgeResult {
+	content := strings.TrimSpace(item.Content)
+	if len(content) > maxChars {
+		cut := content[:maxChars]
+		if lastNL := strings.LastIndex(cut, "\n"); lastNL > maxChars/2 {
+			cut = cut[:lastNL]
+		}
+		item.Content = cut + "\n..."
+	}
+	return item
 }

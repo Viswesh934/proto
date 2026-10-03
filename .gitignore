@@ -30,4 +30,5 @@ Thumbs.db
 
 # Logs & temp
 *.log
+*.jsonl
 tmp/
